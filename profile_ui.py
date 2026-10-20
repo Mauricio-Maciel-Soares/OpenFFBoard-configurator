@@ -16,6 +16,8 @@ import PyQt6.QtWidgets
 import PyQt6.QtGui
 import base_ui
 import helper
+import profile_store
+from profile_transfer import ProfileTransfer
 
 def get_config_dir_path(profiles_filename):
     if sys.platform == "linux" and not os.path.exists(profiles_filename):
@@ -58,6 +60,9 @@ class ProfileUI(base_ui.WidgetUI, base_ui.CommunicationHandler):
         self._profilename_tosave: str = None
 
         self.ui_initialized = False
+        self._startup_messages = []
+        self._transfer = None
+        self._storage_blocked = False
 
         self.load_profile_settings()
         self.load_profiles()
@@ -91,29 +96,61 @@ class ProfileUI(base_ui.WidgetUI, base_ui.CommunicationHandler):
             self.main.systray.refresh_profile_action_status
         )
 
+        self.ui_initialized = True
         self.setEnabled(False)
+        PyQt6.QtCore.QTimer.singleShot(0, self._flush_startup_messages)
+
+    def log(self, message):
+        if not self.ui_initialized:
+            self._startup_messages.append(message)
+        else:
+            super().log(message)
+
+    def _flush_startup_messages(self):
+        for message in self._startup_messages:
+            self.log(message)
+        self._startup_messages.clear()
 
     def save_clicked(self):
-        """Save current seeting in Flash and replace the 'Flash profile' settings by the new one."""
-
-        def log_save_cb(res):
-            """Display the confirmation in log."""
-            self.log("Save in flash: " + str(res))
-            self.save_config_in_profile(self.FLASH_PROFILE_NAME)
-            self.set_save_btn(True)
-        
+        if self._transfer is not None:
+            return
         self.set_save_btn(False)
-        self.get_value_async("sys", "save", callback=log_save_cb)
+        def failed(error):
+            self.log("Flash save failed: " + str(error))
+            self.set_save_btn(True)
+        def saved(reply):
+            self.set_save_btn(True)
+            if reply.strip() != "OK":
+                self.log("Flash save not confirmed: " + reply)
+                return
+            self.log("Settings saved in flash")
+            self.save_config_in_profile(self.FLASH_PROFILE_NAME)
+        self.get_value_async("sys", "save", saved, on_error=failed)
 
     def onclose(self):
-        """Remove the serial call backs on close."""
+        self._cancel_transfer()
         self.remove_callbacks()
 
-    def setEnabled(self, a0: bool) -> None:  # pylint: disable=invalid-name
-        """Refresh the combo box content with profile when connection is up."""
-        if a0 and self.comboBox_profiles.count() == 0:
+    def _cancel_transfer(self):
+        if self._transfer is not None:
+            self._transfer.cancel()
+            self._transfer = None
+            self.remove_callbacks()
+            self.log("Profile operation cancelled; already confirmed changes remain on the board")
+        if self.ui_initialized:
+            self._set_busy(False)
+
+    def setEnabled(self, a0: bool) -> None:
+        if not a0:
+            self._cancel_transfer()
+        elif self.comboBox_profiles.count() == 0:
             self.refresh_combox_list()
         return super().setEnabled(a0)
+
+    def _set_busy(self, busy):
+        for widget in (self.comboBox_profiles, self.toolButton_save,
+                       self.toolButton_manage, self.pushButton_save):
+            widget.setEnabled(not busy)
 
     def set_save_btn(self, status):
         """Enable the save button based on status."""
@@ -131,8 +168,8 @@ class ProfileUI(base_ui.WidgetUI, base_ui.CommunicationHandler):
         self.comboBox_profiles.currentIndexChanged.connect(self.apply_config)
         if (profile_name):
             self.select_profile(profile_name)
-        self.create_or_update_profile_file()
-        self.log('Profile: profiles list updated')
+        if self.create_or_update_profile_file():
+            self.log('Profile: profiles list updated')
 
     def load_profile_settings(self):
         """Load the settings for the profile manager in profile.cfg file."""
@@ -142,59 +179,35 @@ class ProfileUI(base_ui.WidgetUI, base_ui.CommunicationHandler):
                 self.profile_setup = json.load(file)
 
     def load_profiles(self):
-        """Load profiles data in memory : from file if exits, or create a new file."""
-        check = os.path.exists(self.__PROFILES_FILEPATH)
-        if check:
+        if os.path.exists(self.__PROFILES_FILEPATH) or os.path.exists(self.__PROFILES_FILEPATH + ".bak"):
             self.load_profiles_from_file()
         else:
             self.create_or_update_profile_file(create=True)
 
     def load_profiles_from_file(self):
-        """Load profiles from file profiles.json ."""
-        with open(self.__PROFILES_FILEPATH, "r", encoding="utf_8") as profile_file:
-            self.profiles = json.load(profile_file)
-        if self.profiles['release'] < self.__RELEASE :
-            os.rename(self.__PROFILES_FILEPATH, self.__PROFILES_FILEPATH + '.' + str(self.profiles['release']) + '.old')
-            self.create_or_update_profile_file(create=True)
-            self.log("Profile: profiles are not compatible, need to redo them")
-        else:
-            self.log("Profile: profiles loaded")
-        
+        try:
+            self.profiles, recovered = profile_store.load_profiles(self.__PROFILES_FILEPATH)
+            self.log("Profile: recovered last good backup" if recovered else "Profile: profiles loaded")
+        except (OSError, ValueError) as exc:
+            self.profiles = copy.deepcopy(self.__PROFILES_TEMPLATE)
+            self._storage_blocked = True
+            self.log("Profile: " + str(exc) + ". Repair the file before saving.")
         if self.ui_initialized:
             self.refresh_combox_list()
 
-    def create_or_update_profile_file(self, create: bool = False) -> bool:
-        """Create a new profile file or update existing one
-        
-        Args:
-            create: Whether to create a new file
-            
-        Returns:
-            bool: Whether operation succeeded
-        """
+    def create_or_update_profile_file(self, create=False):
+        if self._storage_blocked:
+            self.log("Profile: saving blocked to preserve unreadable files")
+            return False
         if create:
-            self.profiles = self.__PROFILES_TEMPLATE
-            os_lang = PyQt6.QtCore.QLocale.system().name() # get system language, such as zh_CN
-            lang_file = os.path.join("translations", f"{os_lang}.qm")
-            
-            # Use system language if translation exists, otherwise use English
-            if os.path.exists(lang_file):
-                default_lang = os_lang
-            else:
-                default_lang = "en_US"
-                
-            self.profiles['global']['language'] = default_lang
-            self.log(f"Profile: use {default_lang} as default language")
-            self.log("Profile: profile file created")
-
-            # Ensure the parent directory exists
-            os.makedirs(get_config_dir_path(self.__PROFILES_FILENAME), exist_ok=True)
-
+            self.profiles = copy.deepcopy(self.__PROFILES_TEMPLATE)
+            lang = PyQt6.QtCore.QLocale.system().name()
+            self.profiles['global']['language'] = lang if os.path.exists(os.path.join('translations', lang + '.qm')) else 'en_US'
         try:
-            with open(self.__PROFILES_FILEPATH, "w", encoding="utf_8") as f:
-                json.dump(self.profiles, f)
+            profile_store.save_profiles(self.__PROFILES_FILEPATH, self.profiles)
             return True
-        except OSError:
+        except (OSError, ValueError) as exc:
+            self.log("Profile: save failed: " + str(exc))
             return False
 
     def get_global_setting(self,key : str, default = None):
@@ -245,314 +258,60 @@ class ProfileUI(base_ui.WidgetUI, base_ui.CommunicationHandler):
                 self.comboBox_profiles.setCurrentIndex(index)
 
     def apply_config(self):
-        """Apply the config of the current profile to the board.
-
-        Read active class in board
-        Send the paramter for active class to the board.
-        """
-        # if not enabled, don't select profile
-        if not self.isEnabled():
+        if not self.isEnabled() or self._transfer is not None:
             return
-
-        # read the selected profile name, if profile is None, remove the last message
-        profilename = str(self.comboBox_profiles.currentText())
-        if profilename == "" or profilename == ProfileUI.NONE_PROFILE_NAME:
+        name = self.comboBox_profiles.currentText()
+        profile = next((p for p in self.profiles['profiles'] if p['name'] == name), None)
+        if profile is None or name == self.NONE_PROFILE_NAME:
             return
-
-        # get the Running Active class and process result with the write config profile
-        try:
-            self._read_running_class_and_go_cb(self._write_profile_cb)
-            self.profile_selected_event.emit(profilename)
-        except OSError:
-            self.log(F"Profile: can't apply profile '{profilename}', connection is closed.")
-
-    def save_config_in_profile(self, profile_name: str = ""):
-        """Save the current config in the selected profile.
-
-        If the  method is called without parameter, save order come from Save-Icon click :
-            1- read the profile name in the dropbox.
-            2- if the name is 'None' or 'Profile flash', store in flash before all
-        When the profile_name is pass, we don't check if "None or Flash Profile", else we have recursivity with method
-        'save_clicked'.
-        """
-        if not(profile_name) or profile_name == "":
-            self._profilename_tosave = str(self.comboBox_profiles.currentText())
-            
-            if self._profilename_tosave == self.NONE_PROFILE_NAME or \
-            self._profilename_tosave == self.FLASH_PROFILE_NAME:  
-                # if profile to save is "None" or "Profile Flash", we first save in flash and save in profile after
-                self.save_clicked()
-        else:
-            self._profilename_tosave = profile_name
-
-        # get the Running Active class and process result with the read config profile
-        try:
-            self._read_running_class_and_go_cb(self._read_profile_cb)
-        except OSError:
-            self.log(F"Profile: can't save the profile '{self._profilename_tosave}'" +
-                    ", connection is closed.")
-
-
-    def _read_running_class_and_go_cb(self, call_back):
-        """Get the running class from board, and process the call_back when board respond."""
-        # refresh the global var when starting to read value from board
-        self._current_class = -1
-        self._current_command = -1
-        self._current_instance = -1
-        self._map_class_running = []
-        self._running_profile = []
-        # get the list active class from board, after that the the callBack call recursively
-        self.get_value_async("sys", "lsactive", call_back)
-
-    ###############  method helper to construct and go through struct definition ###############
-
-    def _build_running_map(self, buffer: str):
-        self._map_class_running = []
-        # Split the string buffer into array
-        splitted_running_class = [x.split(":") for x in buffer.split("\n")]
-        # Format the arrray in array of object {classname, fullname, instance}
-        formated_iterator = list(
-            map(
-                lambda tab: {
-                    "classname": tab[1],
-                    "fullname": tab[0],
-                    "instance": int(tab[2]),
-                },
-                splitted_running_class,
-            )
-        )
-        # For each class to saved declared in the cfg file,
-        # we filter the running instance to keep only those
-        for call_order in self.profile_setup["callOrder"]:
-            filtered_iterator = filter(
-                lambda x, call=call_order: x["classname"] == call["classname"]
-                and x["fullname"] == call["fullname"],
-                formated_iterator,
-            )
-            self._map_class_running.extend(list(filtered_iterator))
-
-    def _get_instance_running(self, indexclass: int, indexinstance: int):
-        if indexclass > len(self.profile_setup["callOrder"]):
-            return None
-
-        classname = self.profile_setup["callOrder"][indexclass]["classname"]
-        fullname = self.profile_setup["callOrder"][indexclass]["fullname"]
-        classes_running = list(
-            filter(
-                lambda x: x["classname"] == classname and x["fullname"] == fullname,
-                self._map_class_running,
-            )
-        )
-
-        # To test
-        # the request instance is not on a running classes
-        if len(classes_running) == 0 or indexinstance >= len(classes_running):
-            return None
-        else:  # else return the instance number
-            return int(classes_running[indexinstance]["instance"])
-
-    def _get_next_element_to_request(self):
-        is_another_element = False
-
-        # if it's the start
-        if (
-            self._current_class == -1
-            and self._current_command == -1
-            and self._current_instance == -1
-        ):
-            self._current_class = 0
-            self._current_command = 0
-            self._current_instance = 0
-            is_another_element = True
-        # if there is another command for this class, go to next command
-        elif (self._current_command + 1) < len(
-            self.profile_setup["callOrder"][self._current_class]["key"]
-        ):
-            self._current_command += 1
-            is_another_element = True
-        else:
-            # if there is not next command,
-            # we check if there is another instance of this class to request
-            next_instance = self._get_instance_running(
-                self._current_class, self._current_instance + 1
-            )
-            if (
-                next_instance is not None
-            ):  # a next instance exist, we move index to this and restart on 1st dmd
-                self._current_instance += 1
-                self._current_command = 0
-                is_another_element = True
-            elif (self._current_class + 1) < len(
-                self.profile_setup["callOrder"]
-            ):  # there isn't next instance, we move too next class if exist
-                self._current_class += 1
-                self._current_command = 0
-                self._current_instance = 0
-                is_another_element = True
+        def done(items, skipped):
+            self._transfer = None
+            self._set_busy(False)
+            if skipped:
+                self.log("Profile partially applied; firmware does not support: " + ', '.join(skipped))
+                self.profile_selected_event.emit("")
             else:
-                is_another_element = False
+                self.log("Profile '{}' active: {} settings verified on the board".format(name, len(items)))
+                self.profile_selected_event.emit(name)
+        self._start_transfer(done, copy.deepcopy(profile['data']))
 
-        # if the next computed class/instance is not running, we go to the next
-        if (
-            is_another_element
-            and self._get_instance_running(self._current_class, self._current_instance)
-            is None
-        ):
-            return self._get_next_element_to_request()
-
-        return is_another_element
-
-    def _read_value(self, indexclass: int, indexcmd: int, indexinstance: int):
-        if indexclass < len(self.profile_setup["callOrder"]) and indexcmd < len(
-            self.profile_setup["callOrder"][indexclass]["key"]
-        ):
-            classname = self.profile_setup["callOrder"][self._current_class][
-                "classname"
-            ]
-            cmd = self.profile_setup["callOrder"][self._current_class]["key"][
-                self._current_command
-            ]
-            instance = self._get_instance_running(indexclass, indexinstance)
-            self.get_value_async(classname, cmd, self._read_profile_cb, instance)
-
-    def _save_profile_in_file(self, profile_data: str, profilename: str):
-        # search the profile in the json profiles and replace is content
-        profile_json_entry = next(
-            filter(lambda x: x["name"] == profilename, self.profiles["profiles"]), None
-        )
-
-        # if profile is not exist, we copy a new one from "None" profile and
-        # return the profile_json_entry which reference the new profile entry
-        if profile_json_entry is None:
-            profile_json_entry = next(
-                filter(
-                    lambda x: x["name"] == 'None',
-                    self.profiles["profiles"],
-                ),
-                None,
-            )
-            new_profile = copy.deepcopy(profile_json_entry)
-            if new_profile is not None:
-                new_profile["name"] = profilename
-                self.profiles["profiles"].append(new_profile)
-
-            profile_json_entry =  new_profile
-
-        if profile_json_entry is not None:
-            profile_json_entry["data"] = profile_data
-        else:
-            self.log(F"Profile: can't save profile '{profilename}', it doesn't exist")
-
-        # store new config in file
-        self.create_or_update_profile_file()
-        self.log("Profile: '" + profilename + "' is successfully updated")
-        self.select_profile(profilename)
-
-    ####################### Call Back for Async Serial Communication #######################
-
-    def _read_profile_cb(self, buffer: str):
-        # process the incoming buffer
-        if self._current_class == -1:
-            # first call is sys.lsactive to get all active class
-            # that running and we extract a map of class/instances
-            self._build_running_map(buffer)
-        else:
-            # each time we received a value, we store the value
-            # and awe asked the next one in the config file,
-            # for each instance read in the firt call
-            fullname = self.profile_setup["callOrder"][self._current_class]["fullname"]
-            classname = self.profile_setup["callOrder"][self._current_class][
-                "classname"
-            ]
-            cmd = self.profile_setup["callOrder"][self._current_class]["key"][
-                self._current_command
-            ]
-            instance = self._get_instance_running(
-                self._current_class, self._current_instance
-            )
-            self._running_profile.append(
-                {
-                    "fullname": fullname,
-                    "cls": classname,
-                    "instance": instance,
-                    "cmd": cmd,
-                    "value": buffer,
-                }
-            )
-
-        # if there is another command for this class, go to next command
-        if self._get_next_element_to_request():
-            self._read_value(
-                self._current_class, self._current_command, self._current_instance
-            )
-        elif self._profilename_tosave is not False:
-            self._save_profile_in_file(self._running_profile, self._profilename_tosave)
-        else:
-            self.log("Profiles: profile read from board")
-
-    def _write_profile_cb(self, buffer: str):
-        # process the incoming buffer
-        if self._current_class == -1:
-            # first call is sys.lsactive to get all active class
-            # that running and we extract a map of class/instances
-            self._build_running_map(buffer)
-        else:
+    def save_config_in_profile(self, profile_name=""):
+        if self._transfer is not None:
             return
-
-        # read the selected profile name
-        profilename = str(self.comboBox_profiles.currentText())
-        if profilename == "":
+        name = profile_name or self.comboBox_profiles.currentText()
+        if not profile_name and name in (self.NONE_PROFILE_NAME, self.FLASH_PROFILE_NAME):
+            self.save_clicked()
             return
+        def done(items, skipped):
+            self._transfer = None
+            self._set_busy(False)
+            previous = copy.deepcopy(self.profiles)
+            profile = next((p for p in self.profiles['profiles'] if p['name'] == name), None)
+            if profile is None:
+                profile = {'name': name, 'data': []}
+                self.profiles['profiles'].append(profile)
+            profile['data'] = items
+            if not self.create_or_update_profile_file():
+                self.profiles = previous
+                return
+            self.log("Profile '{}' saved from device readings".format(name))
+            if skipped:
+                self.log("Unsupported optional settings omitted: " + ', '.join(skipped))
+            blocked = self.comboBox_profiles.blockSignals(True)
+            self.refresh_combox_list()
+            self.select_profile(name)
+            self.comboBox_profiles.blockSignals(blocked)
+        self._start_transfer(done)
 
-        # From the profile, filter parameters that are running
-        parameters_running = []
-        profile_json_entry = next(
-            filter(lambda x: x["name"] == profilename, self.profiles["profiles"]), None
-        )
-        for running_class in self._map_class_running:
-            parameters_running.extend(
-                list(
-                    filter(
-                        lambda x, running=running_class: x["fullname"]
-                        == running["fullname"]
-                        and x["cls"] == running["classname"]
-                        and x["instance"] == running["instance"],
-                        profile_json_entry["data"],
-                    )
-                )
-            )
-
-        # sent the filter running parameter to the board
-        # and after, read a new time values to refresh UI
-        if len(parameters_running) > 0:
-            for pararmeter in parameters_running:
-                self.send_value(
-                    cls=pararmeter["cls"],
-                    cmd=pararmeter["cmd"],
-                    val=pararmeter["value"],
-                    instance=pararmeter["instance"],
-                )
-
-                # axis.0.degrees?|900
-                replytext = (
-                    "["
-                    + pararmeter["cls"]
-                    + "."
-                    + str(pararmeter["instance"])
-                    + "."
-                    + pararmeter["cmd"]
-                    + "?|"
-                    + str(pararmeter["value"])
-                    + "]"
-                )
-                self.process_virtual_comms_buffer(replytext)
-
-            # self.sendCommand(cls=pararmeter["cls"],
-            # cmd=pararmeter["cmd"], instance=pararmeter["instance"])
-
-        # send message that announce new profile is selected
-        self.profile_selected_event.emit(profilename)
-        self.log("Profile: '" + profilename + "' is active")
+    def _start_transfer(self, done, data=None):
+        self._set_busy(True)
+        self.profile_selected_event.emit("")
+        def failed(error, count):
+            self._transfer = None
+            self._set_busy(False)
+            self.log("Profile failed after {} verified changes: {}. Check the board before retrying.".format(count, error))
+        self._transfer = ProfileTransfer(self, self.profile_setup, done, failed)
+        self._transfer.start(data)
 
 
 class ProfilesDialog(PyQt6.QtWidgets.QDialog):

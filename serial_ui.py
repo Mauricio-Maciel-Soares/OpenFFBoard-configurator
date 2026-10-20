@@ -14,6 +14,7 @@ import PyQt6.QtWidgets
 import base_ui
 import main
 import helper
+from connection_identity import port_identity, same_device
 
 
 class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
@@ -30,7 +31,7 @@ class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
     hidden = PyQt6.QtCore.pyqtSignal()
     visible = PyQt6.QtCore.pyqtSignal(bool)
 
-    def __init__(self, serial: PyQt6.QtSerialPort.QSerialPort, main_ui: main.MainUi):
+    def __init__(self, serial: PyQt6.QtSerialPort.QSerialPort, main_ui: "main.MainUi"):
         """Initialize the manager with the QSerialPort for serial commmunication and the mainUi."""
         base_ui.WidgetUI.__init__(self, main_ui, "serialchooser.ui")
         base_ui.CommunicationHandler.__init__(self)
@@ -43,6 +44,18 @@ class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
         self._ports = []
         self._logging = False
         self._closing = False
+        self._was_open = None
+        self._target = None
+        self._manual_disconnect = False
+        self._reconnect_attempts = 0
+        self._force_reconnect = False
+        self.reconnect_timer = PyQt6.QtCore.QTimer(self)
+        self.reconnect_timer.setSingleShot(True)
+        self.reconnect_timer.timeout.connect(self._retry_connection)
+        self.auto_reconnect = PyQt6.QtWidgets.QCheckBox("Reconnect this device after connection loss", self)
+        self.auto_reconnect.setChecked(bool(self.main.profile_ui.get_global_setting('auto_reconnect', False)))
+        self.auto_reconnect.toggled.connect(self._reconnect_changed)
+        self.gridLayout.addWidget(self.auto_reconnect, 1, 0, 1, 2)
 
         self._serial.errorOccurred.connect(self.serial_error)
 
@@ -53,6 +66,7 @@ class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
         self.pushButton_ok.clicked.connect(self.main_btn)
 
         self.update()
+        self._was_open = None  # Emit initial state after MainUi connects its slots.
 
     def showEvent(self, event): # pylint: disable=unused-argument, invalid-name
         """On show event, init the param.
@@ -88,7 +102,10 @@ class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
         """Read the command input text, display it in history widget and send it to the board."""
         cmd = self.lineEdit_cmd.text() + "\n"
         self.serial_log(">" + cmd)
-        self.serial_write_raw(cmd)
+        try:
+            self.serial_write_raw(cmd)
+        except (OSError, ValueError) as exc:
+            self.main.log("Command not sent: " + str(exc))
 
     def write(self, data):
         """Write data to the serial port."""
@@ -106,25 +123,83 @@ class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
             self.pushButton_refresh.setEnabled(False)
             self.pushButton_send.setEnabled(True)
             self.lineEdit_cmd.setEnabled(True)
-            self.connected.emit(True)
-            self.get_main_classes()
+
         else:
             self.pushButton_connect.setText(self.tr("Connect"))
             self.comboBox_port.setEnabled(True)
             self.pushButton_refresh.setEnabled(True)
             self.pushButton_send.setEnabled(False)
             self.lineEdit_cmd.setEnabled(False)
-            self.connected.emit(False)
+
             self.groupBox_system.setEnabled(False)
 
-    def serial_connect_button(self):
-        """Check if it's not connected, and call start the serial connection."""
-        if not self._serial.isOpen() and self._port is not None:
-            self.serial_connect()
-        else:
-            self._serial.close()
+        opened = self._serial.isOpen()
+        if opened != self._was_open:
+            was_open = self._was_open
+            self._was_open = opened
+            self.connected.emit(opened)
+            if opened:
+                self.get_main_classes()
+            elif was_open:
+                self.request_reconnect()
 
-        self.update()
+    def _reconnect_changed(self, enabled):
+        self.main.profile_ui.set_global_setting('auto_reconnect', enabled)
+        if not enabled:
+            self.cancel_reconnect()
+
+    def cancel_reconnect(self):
+        self.reconnect_timer.stop()
+        self._force_reconnect = False
+        self._manual_disconnect = True
+        self.pushButton_connect.setText(self.tr("Disconnect") if self._serial.isOpen() else self.tr("Connect"))
+
+    def request_reconnect(self, force=False):
+        if force:
+            self._manual_disconnect = False
+            self._force_reconnect = True
+        if self._manual_disconnect or not self._target or getattr(self.main, '_shutdown_done', False):
+            return
+        if not (self.auto_reconnect.isChecked() or self._force_reconnect):
+            return
+        if self.reconnect_timer.isActive():
+            return
+        self._reconnect_attempts = 0
+        self.pushButton_connect.setText("Cancel reconnect")
+        self.main.log("Connection lost. Waiting for the same device...")
+        self.reconnect_timer.start(1500)
+
+    def _retry_connection(self):
+        if self._manual_disconnect or getattr(self.main, '_shutdown_done', False) or self._serial.isOpen():
+            return
+        self._reconnect_attempts += 1
+        ports = PyQt6.QtSerialPort.QSerialPortInfo.availablePorts()
+        matches = [p for p in ports if same_device(self._target, p)]
+        if len(matches) == 1:
+            self.get_ports()
+            index = next(i for i, p in enumerate(self._ports) if same_device(self._target, p))
+            self.comboBox_port.setCurrentIndex(index)
+            self.serial_connect()
+            self.update()
+            if self._serial.isOpen():
+                self._force_reconnect = False
+                self.main.log("Device reconnected. Pending changes were not replayed.")
+                return
+        if self._reconnect_attempts >= 8:
+            self.main.log("Reconnect stopped after 8 attempts. Check the cable and selected port.")
+            self.cancel_reconnect()
+            return
+        self.pushButton_connect.setText("Cancel reconnect")
+        self.reconnect_timer.start(min(15000, 1000 * 2 ** self._reconnect_attempts))
+
+    def serial_connect_button(self):
+        if self._serial.isOpen() or self.reconnect_timer.isActive():
+            self.cancel_reconnect()
+            self.main.reset_port(immediate=True)
+        elif self._port is not None:
+            self._manual_disconnect = False
+            self.serial_connect()
+            self.update()
 
     def serial_connect(self):
         """Check if port is not open and open it with right settings."""
@@ -141,6 +216,7 @@ class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
                 # Discard whatever the OS buffered before we started listening
                 self._serial.clear(PyQt6.QtSerialPort.QSerialPort.Direction.AllDirections)
                 self._serial.setDataTerminalReady(True)
+                self._target = port_identity(self._port)
 
     def serial_error(self, error):
         """Close the port when the device reports an unrecoverable error."""
@@ -247,9 +323,9 @@ class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
         def fct(i):
             """Store the main currently selected to refresh the UI."""
             self.main_id = i
+            self.get_value_async("sys", "lsmain", self.update_mains, delete=True)
 
         self.get_value_async("main", "id", fct, conversion=int, delete=True)
-        self.get_value_async("sys", "lsmain", self.update_mains, delete=True)
 
     def main_btn(self):
         """Read the select main class in the combobox.
