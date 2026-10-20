@@ -3,6 +3,8 @@ A simple GUI to configure the [Open FFBoard](https://github.com/Ultrawipf/OpenFF
 
 This allows complete configuration of all settings in the Open FFBoard firmware at runtime.
 
+Fork improvements: [communication, verified profiles, axis settings and diagnostics (Português)](docs/reliability-and-diagnostics.pt-BR.md).
+
 Requires the latest firmware version most of the time from a matching branch.
 When errors occur hinting at missing commands make sure your firmware and configurator versions are compatible!
 

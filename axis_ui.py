@@ -10,6 +10,9 @@ from base_ui import WidgetUI,CommunicationHandler
 from encoderconf_ui import EncoderOptions
 import encoder_tuning_ui
 import expo_ui
+from advanced_axis_ui import AdvancedAxisDialog
+from diagnostics_ui import DiagnosticsDialog
+from PyQt6.QtWidgets import QPushButton
 
 
 class AxisUI(WidgetUI,CommunicationHandler):
@@ -40,6 +43,14 @@ class AxisUI(WidgetUI,CommunicationHandler):
         self.encoder_tuning_dlg = encoder_tuning_ui.AdvancedTuningDialog(self, self.axis)
 
         self.expo_dlg = expo_ui.ExpoTuneDialog(self,self.axis)
+        self.advanced_axis_dlg = AdvancedAxisDialog(self, self.axis)
+        self.diagnostics_dlg = DiagnosticsDialog(self, self.axis)
+        self.advanced_axis_button = QPushButton("Advanced axis settings", self)
+        self.diagnostics_button = QPushButton("Live diagnostics / CSV", self)
+        self.verticalLayout_3.addWidget(self.advanced_axis_button)
+        self.verticalLayout_3.addWidget(self.diagnostics_button)
+        self.advanced_axis_button.clicked.connect(self.advanced_axis_dlg.show)
+        self.diagnostics_button.clicked.connect(self.diagnostics_dlg.show)
 
         self.horizontalSlider_power.valueChanged.connect(self.powerSiderMoved)
 
@@ -193,6 +204,8 @@ class AxisUI(WidgetUI,CommunicationHandler):
     # Tab is hidden
     def hideEvent(self,event):
         self.encoder_tuning_dlg.close()
+        self.advanced_axis_dlg.close()
+        self.diagnostics_dlg.close()
         self.timer.stop()
 
     # Timer interval reached

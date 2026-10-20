@@ -8,7 +8,8 @@ from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtCore import QTimer
 import logging
 
-from helper import throttle
+import weakref
+from command_requests import RequestQueue, CommandError, same_value
 
 # Regex group indices:
 GRP_CLS         = 0
@@ -24,10 +25,10 @@ class SerialComms(QObject):
     MAX_DELAY_SEND_CMD = 30
     MAX_REPLY_BUFFER = 65536
 
-    cmdRegex = re.compile(r"\[(\w+)\.(?:(\d+)\.)?(\w+)([?!=]?)(?:(\d+))?(?:\?(\d+))?\|(.+)\]",re.DOTALL)
+    cmdRegex = re.compile(r"\[(\w+)\.(?:(\d+)\.)?(\w+)([?!=]?)(?:([-+]?\d+))?(?:\?([-+]?\d+))?\|(.*)\]",re.DOTALL)
     callbackDict = {}
     rawReply = pyqtSignal(str)
-    send_buffer = []
+    _instances = weakref.WeakSet()
 
     def __init__(self,main,serialport : PyQt6.QtSerialPort.QSerialPort):
         QObject.__init__(self)
@@ -38,6 +39,39 @@ class SerialComms(QObject):
         self.replytext = ""
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.logger = logging.getLogger("serial_comms")
+        self.send_buffer = []
+        self.send_callbacks = []
+        self._resetting = False
+        self.capabilities = {}
+        self.requests = RequestQueue(self.serialWriteRaw, self._log_error, defer_sent=True)
+        self.request_timer = QTimer(self)
+        self.request_timer.setInterval(100)
+        self.request_timer.timeout.connect(self._check_requests)
+        self.request_timer.start()
+        self.write_timer = QTimer(self)
+        self.write_timer.setSingleShot(True)
+        self.write_timer.timeout.connect(self._send_over_uart)
+        self._instances.add(self)
+
+    def _check_requests(self):
+        if self.send_buffer and any(queue and queue[0]['deadline'] is not None
+                                    and time.monotonic() >= queue[0]['deadline']
+                                    for queue in self.requests.queues.values()):
+            self._transport_failed("Serial output stalled; unsent commands discarded")
+            return
+        self.requests.expire()
+
+    def _transport_failed(self, message):
+        self._log_error(message)
+        self.reset()
+        if hasattr(self.main, 'reset_port'):
+            self.main.reset_port(immediate=True)
+        else:
+            self.serial.close()
+
+    def _log_error(self, error):
+        self.logger.warning(str(error))
+        self.main.log(str(error))
 
     @staticmethod
     def registerCallback(handler,cls,cmd,callback,instance=0,conversion=None,adr=None,delete=False,typechar='?'):
@@ -55,93 +89,128 @@ class SerialComms(QObject):
 
     @staticmethod
     def removeCallbacks(handler):
+        for comms in list(SerialComms._instances):
+            comms.requests.cancel(handler)
         for cls,item in (SerialComms.callbackDict.items()):
             SerialComms.callbackDict[cls] = [ entry for entry in item if entry["handler"] != handler]
 
     def removeAllCallbacks(self):
         SerialComms.callbackDict.clear()
 
-    def getValueAsync(self,handler,cls,cmd,callback,instance=0,conversion=None,adr=None,typechar='?',delete=True):
-        if typechar == None:
-            typechar = ''
-        SerialComms.registerCallback(handler=handler,cls=cls,cmd=cmd,callback=callback,instance=instance,conversion=conversion,adr=adr,delete=delete,typechar=typechar)
-        if adr == None:
-            self.serialWriteRaw(f"{cls}.{instance}.{cmd}{typechar};")
-        else:
-            self.serialWriteRaw(f"{cls}.{instance}.{cmd}{typechar}{adr};")
+    def getValueAsync(self,handler,cls,cmd,callback,instance=0,conversion=None,adr=None,
+                      typechar='?',delete=True,on_error=None,timeout=3.0):
+        typechar = typechar or ''
+        if not delete:
+            self.registerCallback(handler, cls, cmd, callback, instance, conversion,
+                                  adr, False, typechar)
+            callback, conversion = None, None
+        wire = "{}.{}.{}{}{};".format(cls, instance, cmd, typechar,
+                                     '' if adr is None else adr)
+        self._request(handler, (cls, instance, cmd, typechar, adr), wire,
+                      callback, conversion, on_error, timeout)
+
+    def _request(self, handler, key, wire, callback=None, conversion=None,
+                 on_error=None, timeout=3.0, value=None):
+        if not self.serial.isOpen() or self._resetting:
+            # Avoid reentering widgets while their constructors are still running.
+            error = CommandError("DISCONNECTED", wire.rstrip(';'))
+            QTimer.singleShot(0, lambda: self.requests._invoke(on_error or self._log_error, error))
+            return
+        self.requests.add(handler, key, wire, callback, conversion, on_error, timeout, value)
 
     def sendCommand(self,cls,cmd,instance=0,typechar='?',adr=None):
-        if(adr):
-            cmdstring = f"{cls}.{instance}.{cmd}{typechar}{adr};"
-        else:
-            cmdstring = f"{cls}.{instance}.{cmd}{typechar};"
-        self.serialWriteRaw(cmdstring)
+        key = (cls, instance, cmd, typechar or '', adr)
+        if key not in self.requests.queues and key not in self.requests.blocked:
+            self.getValueAsync(self, cls, cmd, None, instance, adr=adr, typechar=typechar)
 
-    def sendValue(self,handler,cls,cmd,val,adr=None,instance=0):
-        cmdstring  = f"{cls}.{instance}.{cmd}={val}"
-        if adr != None:
-            cmdstring+="?"+str(adr)
-        cmdstring += ";"
-        SerialComms.registerCallback(handler=handler,cls=cls,cmd=cmd,callback=self.checkOk,instance=instance,adr=adr,delete=True,typechar='=')
-        self.serialWriteRaw(cmdstring)
+    def sendValue(self,handler,cls,cmd,val,adr=None,instance=0,callback=None,on_error=None):
+        wire = "{}.{}.{}={}{};".format(cls, instance, cmd, val,
+                                      '' if adr is None else '?' + str(adr))
+        self._request(handler, (cls, instance, cmd, '=', adr), wire,
+                      callback or self.checkOk, on_error=on_error, value=val)
+
+    def setValueVerified(self,handler,cls,cmd,val,callback,on_error=None,instance=0,adr=None):
+        fail = on_error or self._log_error
+        command = "{}.{}.{}".format(cls, instance, cmd)
+        def read_back(actual):
+            if same_value(val, actual):
+                callback(actual)
+            else:
+                fail(CommandError("VERIFY_FAILED", command,
+                                  "requested {}; read back {}".format(val, actual)))
+        def acknowledged(reply):
+            if reply.strip() != "OK":
+                fail(CommandError("INVALID_ACK", command, reply))
+                return
+            self.getValueAsync(handler, cls, cmd, read_back, instance,
+                               adr=adr, on_error=fail)
+        self.sendValue(handler, cls, cmd, val, adr, instance, acknowledged, fail)
 
     def reset(self):
-        """Drops all buffered receive and send data so nothing leaks into the next session."""
+        """Drop buffers and pending requests; never replay writes on reconnect."""
+        self._resetting = True
         self.replytext = ""
         self.decoder.reset()
         self.send_buffer = []
+        self.send_callbacks = []
+        self.write_timer.stop()
+        self.requests.reset()
+        self.capabilities.clear()
+        for cls in self.callbackDict:
+            self.callbackDict[cls] = [c for c in self.callbackDict[cls] if not c['delete']]
+        self._resetting = False
 
     def checkOk(self,reply):
-        if(reply == "OK" or reply.find("Err") == -1):
-            return
-        else:
-            self.main.log(reply)
+        if reply.strip() != "OK":
+            self._log_error(reply)
 
-    def pack_cmd(self,cmd):
-        # if buffer is empty, add the line
-        if len(self.send_buffer) == 0 :
-            self.send_buffer.append(cmd)
-            self.logger.debug("First command added")
-        else :
-        # if buffer is not empty, take the last line, append the new line
-            last_line = self.send_buffer.pop()
-            last_line += cmd
-            if len(last_line) < SerialComms.MAX_REQUEST_SIZE :
-                self.send_buffer.append(last_line)
-                self.logger.debug("New command packed (size %d)", len(last_line))
+    def pack_cmd(self,cmd,on_sent=None):
+        # Validate the whole input before changing the queue. Limits are bytes.
+        atoms = [(part.strip() + ';').encode('utf-8')
+                 for part in re.split(r'[;\r\n]+', cmd) if part.strip()]
+        if any(len(atom) > self.MAX_REQUEST_SIZE for atom in atoms):
+            raise ValueError("A single command exceeds 1024 UTF-8 bytes")
+        if sum(map(len, self.send_buffer)) + sum(map(len, atoms)) > 65536:
+            raise ValueError("Serial output queue is full")
+        for atom in atoms:
+            if self.send_buffer and len(self.send_buffer[-1]) + len(atom) <= self.MAX_REQUEST_SIZE:
+                self.send_buffer[-1] += atom
             else:
-                # if the last buffer + cmd is over 1024, we split all the commands and make 1024 max size new_line
-                # and append it to be sent
-                new_line = ""
-                for line in last_line.split(";"):
-                    if (len(new_line) + len(line) +1) < SerialComms.MAX_REQUEST_SIZE :
-                        new_line += line + ";"
-                    else:
-                        self.send_buffer.append(new_line)
-                        new_line = line
-                self.send_buffer.append(new_line)
-                self.logger.debug("New command packed with new line (size %d/line %d)", len(self.send_buffer) ,len(new_line))
+                self.send_buffer.append(atom)
+                self.send_callbacks.append([])
+        if on_sent and atoms:
+            self.send_callbacks[-1].append((len(self.send_buffer[-1]), on_sent))
 
-    def serialWriteRaw(self,cmdraw):
-        self.pack_cmd(cmdraw)
-        self._send_over_uart()
-    
-    @throttle(MAX_DELAY_SEND_CMD)
+    def serialWriteRaw(self,cmdraw,on_sent=None):
+        if not self.serial.isOpen() or self._resetting:
+            raise OSError("Serial port is closed")
+        self.pack_cmd(cmdraw,on_sent)
+        if not self.write_timer.isActive():
+            self._send_over_uart()
+
     def _send_over_uart(self):
-        # exit if serial is not opened
-        if not self.serial.isOpen() : return
-
-        ## send buffer commands to the board if the port is opened
-        cmd_not_sent = []
-        self.logger.debug(F"Send %d lines to uart, commm is %d %s", len(self.send_buffer), self.serial.isOpen(),self.send_buffer)
-        for cmdraw in self.send_buffer:
-            if self.serial.isOpen():
-                # if command can't be send, we reput them in the buffer for a retry
-                if self.serial.write(bytes(cmdraw,"utf-8")) == -1:
-                    cmd_not_sent.append(cmdraw)
-            else:
-                cmd_not_sent.append(cmdraw)
-        self.send_buffer = cmd_not_sent
+        if not self.serial.isOpen():
+            self.reset()
+            return
+        if not self.send_buffer:
+            return
+        data = self.send_buffer[0]
+        written = self.serial.write(data)
+        if written < 0:
+            self._transport_failed("Serial write failed: " + self.serial.errorString())
+            return
+        callbacks = self.send_callbacks[0]
+        ready = [callback for offset, callback in callbacks if offset <= written]
+        self.send_callbacks[0] = [(offset - written, callback) for offset, callback in callbacks if offset > written]
+        if written < len(data):
+            self.send_buffer[0] = data[written:]
+        else:
+            self.send_buffer.pop(0)
+            self.send_callbacks.pop(0)
+        for callback in ready:
+            callback()
+        # Coalesce bursts and allow the firmware to consume each bounded packet.
+        self.write_timer.start(self.MAX_DELAY_SEND_CMD)
 
 
     def serialReceive(self):
@@ -193,51 +262,29 @@ class SerialComms(QObject):
         adr = int(groups[GRP_CMDVAL2]) if groups[GRP_CMDVAL2] != None else int(groups[GRP_CMDVAL1]) if groups[GRP_CMDVAL1] != None and typechar == '?' else None  
         val = int(groups[GRP_CMDVAL1]) if groups[GRP_CMDVAL1] != None  else None
     
-        if cls in SerialComms.callbackDict:
-            expired = []
-            # Iterate a snapshot. Callbacks may register or remove entries while running
-            for callbackObject in list(SerialComms.callbackDict[cls]):
-                if callbackObject not in SerialComms.callbackDict[cls]:
-                    continue # Already removed by a nested call
-                if callbackObject["cmd"] != cmd:
-                    continue
-                if (instance != callbackObject["instance"]) and (callbackObject["instance"] != 0xff):
-                    #print("ignoring",callbackObject,instance)
-                    continue
-                if typechar != callbackObject["typechar"] and callbackObject["typechar"] != None:
-                    #print("Ignoring",typechar,callbackObject["typechar"])
-                    continue
-
-                if adr != None and adr != callbackObject["address"]:
-                    #print("Ignoring address",callbackObject,adr)
-                    continue
-
-                if reply == "NOT_FOUND":
-                    self.logger.error(f"Unknown command {cmd}")
-                    #print(f"Cmd {cmd} not found. check syntax")
-                    continue
-                if reply == "ERR":
-                    self.logger.error(f"Error executing command {cmd}")
-                    continue
-                value = reply # Conversion must not leak into the next callback
-                if(callbackObject["convert"]):
-                    try:
-                        value = callbackObject["convert"](reply)
-                    except ValueError as e:
-                        self.logger.error("Error converting object: " + str(e))
-                try:
-                    callbackObject["callback"](value)
-                    
-                except RuntimeError as e:
-                    self.logger.error(f"Error calling object {callbackObject['callback']}: " + str(e))
-                    callbackObject["delete"] = True # force delete
-
-                if callbackObject["delete"]: # delete if flag is set
-                    expired.append(callbackObject)
-                    deleted = True
-
-            for callbackObject in expired:
-                if callbackObject in SerialComms.callbackDict[cls]:
-                    SerialComms.callbackDict[cls].remove(callbackObject)
-
+        callbacks = list(self.callbackDict.get(cls, []))
+        key = (cls, instance, cmd, typechar, adr)
+        stale = key in self.requests.blocked
+        deleted = self.requests.reply(key, reply, val)
+        if stale:
+            return True
+        # Remove one-shots before invoking user code (which may run a nested event loop).
+        matching = [c for c in callbacks if c in self.callbackDict.get(cls, [])
+                    and c['cmd'] == cmd and c['instance'] in (instance, 0xff)
+                    and c['typechar'] in (typechar, None) and c['address'] == adr]
+        for entry in matching:
+            if entry['delete']:
+                self.callbackDict[cls].remove(entry)
+                deleted = True
+        for entry in matching:
+            if reply.strip().upper() in ("ERR", "NOT_FOUND", "BUSY"):
+                self.logger.warning("%s.%s: %s", cls, cmd, reply)
+                continue
+            try:
+                value = entry['convert'](reply) if entry['convert'] else reply
+                entry['callback'](value)
+            except Exception as exc:
+                self.logger.error("Callback failed for %s.%s: %s", cls, cmd, exc)
+                if entry in self.callbackDict.get(cls, []):
+                    self.callbackDict[cls].remove(entry)
         return deleted
