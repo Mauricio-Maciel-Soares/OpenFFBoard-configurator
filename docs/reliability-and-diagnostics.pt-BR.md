@@ -32,10 +32,43 @@ Se um parâmetro opcional não existir no firmware, o configurador informa aplic
 parcial. Falhas interrompem a sequência e identificam quantas alterações já foram
 confirmadas. Não há reversão automática: alterações já enviadas podem permanecer.
 
-`encvel` e `maxtorquerate` entram na captura do perfil quando disponíveis. Perfis
-antigos que não contêm esses campos continuam funcionando. O botão de salvar na
-flash continua explícito; aplicar um perfil não salva automaticamente todos os
-outros parâmetros da placa.
+Os perfis incluem, quando anunciados pelo firmware:
+
+| Parâmetro | Conteúdo e unidade |
+|---|---|
+| `axis.N.maxtorquerate` | Limite de variação do comando, em counts/ms |
+| `axis.N.encvel` | Preferência pela velocidade CAN recente (0/1) |
+| `axis.N.filterProfile_id` | Índice do perfil de filtros de velocidade/aceleração |
+| `odrv.N.maxtorque` | Escala de torque enviada ao ODrive, em 0,01 Nm: 3000 = 30 Nm |
+
+A captura reconhece os nomes reais `ODrive (M0)` e `ODrive (M1)`, incluindo a
+instância anunciada pela placa. Aceita a resposta atual de `sys.lsactive`, com
+cinco campos por linha, e a antiga de três campos. Não cria valores padrão para
+parâmetros ausentes nem modifica perfis antigos automaticamente.
+
+Antes de aplicar, todos os valores são lidos da placa. Se qualquer
+`odrv.N.maxtorque` aumentar, uma única janela mostra o valor atual e o proposto,
+em Nm, para cada instância afetada. A resposta padrão é **No**. Recusar, fechar
+a janela ou desconectar antes da confirmação impede **todas** as escritas do
+perfil. Depois de confirmar, cada escrita continua exigindo ACK e leitura de
+verificação. Uma falha posterior pode deixar alterações já aplicadas na placa.
+
+A confirmação vale para qualquer aumento, sem um limiar arbitrário; uma redução
+ou valor igual não precisa dessa confirmação. Valores fora de 0..4095
+(0..40,95 Nm, faixa do driver deste firmware) ou uma leitura atual inválida
+interrompem a aplicação. Essa escala não altera o limite de corrente do ODrive.
+
+Para atualizar um perfil antigo com os novos campos, conecte a placa, confira
+os valores desejados e use o **ícone de disquete** no perfil nomeado: ele captura
+as leituras atuais, incluindo os campos disponíveis. **Copy as** duplica os
+dados que já estão no perfil; não preenche campos novos sozinho.
+
+O botão **Save** continua sendo a gravação geral explícita na flash.
+`filterProfile_id` e `odrv.maxtorque` dependem desse Save para persistir na placa.
+No firmware personalizado com persistência, alterações de `encvel` e
+`maxtorquerate` já são gravadas pelo próprio firmware, inclusive ao aplicar um
+perfil. Firmwares antigos mantêm seu comportamento original. Seleção automática
+por jogo não faz parte desta alteração.
 
 O arquivo `profiles.json` usa arquivo temporário, sincronização e substituição
 atômica. `profiles.json.bak` guarda a versão anterior válida. Um arquivo danificado

@@ -62,6 +62,7 @@ class ProfileUI(base_ui.WidgetUI, base_ui.CommunicationHandler):
         self.ui_initialized = False
         self._startup_messages = []
         self._transfer = None
+        self._torque_confirmation = None
         self._storage_blocked = False
 
         self.load_profile_settings()
@@ -137,6 +138,11 @@ class ProfileUI(base_ui.WidgetUI, base_ui.CommunicationHandler):
             self._transfer = None
             self.remove_callbacks()
             self.log("Profile operation cancelled; already confirmed changes remain on the board")
+        if self._torque_confirmation is not None:
+            box = self._torque_confirmation
+            self._torque_confirmation = None
+            box.reject()
+            box.deleteLater()
         if self.ui_initialized:
             self._set_busy(False)
 
@@ -303,14 +309,47 @@ class ProfileUI(base_ui.WidgetUI, base_ui.CommunicationHandler):
             self.comboBox_profiles.blockSignals(blocked)
         self._start_transfer(done)
 
+    def _confirm_torque_increase(self, changes, respond):
+        """Ask once for all increases, before any setting from the profile is sent."""
+        box = PyQt6.QtWidgets.QMessageBox(self.window())
+        box.setWindowTitle(self.tr("Confirm torque increase"))
+        box.setIcon(PyQt6.QtWidgets.QMessageBox.Icon.Warning)
+        box.setTextFormat(PyQt6.QtCore.Qt.TextFormat.PlainText)
+        lines = [
+            "odrv.{}.maxtorque: {:.2f} -> {:.2f} Nm".format(
+                change["instance"], change["current"] / 100.0, change["target"] / 100.0)
+            for change in changes
+        ]
+        box.setText(self.tr("Applying this profile increases the ODrive torque scale:")
+                    + "\n\n" + "\n".join(lines) + "\n\n"
+                    + self.tr("This can increase wheel force for the same FFB input. Apply the entire profile?"))
+        buttons = PyQt6.QtWidgets.QMessageBox.StandardButton
+        box.setStandardButtons(buttons.Yes | buttons.No)
+        box.setDefaultButton(buttons.No)
+        box.setEscapeButton(buttons.No)
+        box.setWindowModality(PyQt6.QtCore.Qt.WindowModality.WindowModal)
+        self._torque_confirmation = box
+        def finished(result):
+            if self._torque_confirmation is not box:
+                return
+            self._torque_confirmation = None
+            box.deleteLater()
+            respond(result == buttons.Yes.value)
+        box.finished.connect(finished)
+        box.open()
+
     def _start_transfer(self, done, data=None):
         self._set_busy(True)
         self.profile_selected_event.emit("")
         def failed(error, count):
             self._transfer = None
             self._set_busy(False)
-            self.log("Profile failed after {} verified changes: {}. Check the board before retrying.".format(count, error))
-        self._transfer = ProfileTransfer(self, self.profile_setup, done, failed)
+            if error.code == "CANCELLED" and count == 0:
+                self.log("Profile application cancelled; no settings were written")
+            else:
+                self.log("Profile failed after {} verified changes: {}. Check the board before retrying.".format(count, error))
+        self._transfer = ProfileTransfer(self, self.profile_setup, done, failed,
+                                         confirm_torque_increase=self._confirm_torque_increase)
         self._transfer.start(data)
 
 
