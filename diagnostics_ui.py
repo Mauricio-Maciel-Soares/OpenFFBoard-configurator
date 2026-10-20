@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushBut
 from base_ui import CommunicationHandler
 from diagnostics import AXIS_FIELDS, ODRIVE_FIELDS, parse_payload, loop_rates, decode_axis_errors, export_csv
 from profile_store import atomic_write
+from torque_trace_ui import TorqueTraceDialog
 
 
 class DiagnosticsDialog(QDialog, CommunicationHandler):
@@ -17,6 +18,8 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
     def __init__(self, parent, axis):
         super().__init__(parent)
         self.axis = axis
+        self.main = parent.main
+        self.trace_dialog = None
         self.rows = deque(maxlen=600)
         self.running = False
         self.generation = 0
@@ -53,6 +56,9 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
         self.export_button.clicked.connect(self.export)
         for button in (self.start_button, self.stop_button, self.export_button):
             buttons.addWidget(button)
+        self.trace_button = QPushButton("Torque / current study")
+        self.trace_button.clicked.connect(self.open_trace)
+        buttons.addWidget(self.trace_button)
         layout.addLayout(buttons)
         self.metric = QComboBox()
         for title, field in (("Output torque command (counts)", 'axis_output_counts'),
@@ -62,6 +68,9 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
                              ("Host sampling interval (ms)", 'host_interval_ms'),
                              ("Firmware last dt (µs)", 'axis_dt_us'),
                              ("Firmware loop rate between snapshots (Hz)", 'loop_hz'),
+                             ("Firmware loop interval standard deviation (µs)", 'axis_window_stddev_us'),
+                             ("CAN encoder interval (µs)", 'odrive_encoder_interval_last_us'),
+                             ("CAN Iq interval (µs)", 'odrive_iq_interval_last_us'),
                              ("ODrive measured Iq, fresh only (A)", 'iq_fresh_measured_a')):
             self.metric.addItem(title, field)
         self.metric.currentIndexChanged.connect(self._plot)
@@ -121,6 +130,15 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
 
     def hideEvent(self, event):
         self.stop()
+        if self.trace_dialog is not None:
+            self.trace_dialog.close()
+
+    def open_trace(self):
+        self.stop()
+        if self.trace_dialog is None:
+            self.trace_dialog = TorqueTraceDialog(self, self.axis)
+        self.trace_dialog.show()
+        self.trace_dialog.raise_()
 
     def connection_changed(self, connected):
         if not connected and self.running:
@@ -140,14 +158,16 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
                'request_timeouts': self.comms.requests.timeouts, 'request_errors': self.comms.requests.errors,
                'disconnects': self.disconnects}
         self.previous_start = started
-        commands = [('axis', self.axis, 'diag'), ('main', 0, 'hidrate'), ('main', 0, 'cfrate')]
+        axis_cmd = 'diag' if ('axis', self.axis, 'diag2') in self.unsupported else 'diag2'
+        commands = [('axis', self.axis, axis_cmd), ('main', 0, 'hidrate'), ('main', 0, 'cfrate')]
         if ('axis', self.axis, 'diag') in self.unsupported:
             commands[0] = ('axis', self.axis, 'curtorque')
         if self.odrive_enabled.isChecked():
             instance = self.odrive_instance.value()
             row['odrive_instance'] = instance
             row['odrive_error_version'] = self.odrive_version.currentData()
-            commands += [('odrv', instance, name) for name in ('diag', 'connected', 'errors')]
+            odrv_cmd = 'diag' if ('odrv', instance, 'diag2') in self.unsupported else 'diag2'
+            commands += [('odrv', instance, name) for name in (odrv_cmd, 'connected', 'errors')]
         def next_command():
             if not self.running or generation != self.generation:
                 return
@@ -175,7 +195,7 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
                 row['{}_{}_reply_s'.format(cls, cmd)] = time.monotonic() - self.start_time
                 row['{}_{}_request_ms'.format(cls, cmd)] = (time.monotonic() - sent) * 1000
                 try:
-                    if cmd == 'diag':
+                    if cmd in ('diag', 'diag2'):
                         data = parse_payload(value, AXIS_FIELDS if cls == 'axis' else ODRIVE_FIELDS)
                         prefix = 'axis_' if cls == 'axis' else 'odrive_'
                         row.update({prefix + k: v for k, v in data.items()})
@@ -206,7 +226,9 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
                     return
                 if error.code == 'NOT_FOUND':
                     self.unsupported.add(key)
-                    if key == ('axis', self.axis, 'diag'):
+                    if cmd == 'diag2':
+                        commands.insert(0, (cls, instance, 'diag'))
+                    elif key == ('axis', self.axis, 'diag'):
                         commands.insert(0, ('axis', self.axis, 'curtorque'))
                     next_command()
                 else:

@@ -3,6 +3,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QHBoxLayout,
                             QLabel, QDoubleSpinBox, QCheckBox, QPushButton)
 from base_ui import CommunicationHandler
+from slew_profiles_ui import SlewProfilesDialog
 
 
 class AdvancedAxisDialog(QDialog, CommunicationHandler):
@@ -11,6 +12,7 @@ class AdvancedAxisDialog(QDialog, CommunicationHandler):
         self.axis = axis
         self.generation = 0
         self.values = {}
+        self.profiles_dialog = None
         self.setWindowTitle("Advanced axis settings — axis {}".format(axis))
         self.resize(540, 290)
         layout = QVBoxLayout(self)
@@ -45,6 +47,16 @@ class AdvancedAxisDialog(QDialog, CommunicationHandler):
         buttons.addWidget(self.refresh)
         buttons.addWidget(self.apply_button)
         layout.addLayout(buttons)
+        self.profiles_button = QPushButton('Persistent slew profiles', self)
+        self.profiles_button.clicked.connect(self.open_profiles)
+        layout.addWidget(self.profiles_button)
+
+    def open_profiles(self):
+        if self.profiles_dialog is None:
+            self.profiles_dialog = SlewProfilesDialog(self, self.axis)
+            self.profiles_dialog.finished.connect(lambda _: self.read_values() if self.isVisible() else None)
+        self.profiles_dialog.show()
+        self.profiles_dialog.raise_()
 
     def showEvent(self, event):
         self.read_values()
@@ -52,8 +64,11 @@ class AdvancedAxisDialog(QDialog, CommunicationHandler):
     def hideEvent(self, event):
         self.generation += 1
         self.remove_callbacks()
+        if self.profiles_dialog is not None:
+            self.profiles_dialog.close()
 
     def _busy(self, busy):
+        self.profiles_button.setEnabled(not busy)
         self.refresh.setEnabled(not busy)
         self.apply_button.setEnabled(not busy and bool(self.values))
         self.rate.setEnabled(not busy and 'maxtorquerate' in self.values)

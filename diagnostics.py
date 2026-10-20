@@ -2,6 +2,7 @@
 import csv
 import io
 import math
+from torque_study import AXIS_V2_EXTRA, ODRIVE_V2_EXTRA
 
 AXIS_FIELDS = "version sequence time_us dt_us min_dt_us max_dt_us clip_count slew_count effect_counts requested_counts clipped_counts output_counts position_speed_deg_s encoder_speed_deg_s speed_deg_s accel_deg_s2 encoder_valid encoder_used driver_ready".split()
 ODRIVE_FIELDS = "version time_ms iq_sequence iq_age_ms iq_setpoint_a iq_measured_a encoder_sequence encoder_age_ms velocity_turns_s tx_sequence tx_age_ms queued_torque_nm tx_errors".split()
@@ -33,7 +34,11 @@ def decode_axis_errors(code, version='raw'):
 
 def parse_payload(payload, fields):
     parts = payload.strip().split(',')
-    if len(parts) != len(fields) or parts[0] != '1':
+    version = '1'
+    if parts[0] == '2' and fields in (AXIS_FIELDS, ODRIVE_FIELDS):
+        fields = fields + (AXIS_V2_EXTRA if fields == AXIS_FIELDS else ODRIVE_V2_EXTRA)
+        version = '2'
+    if len(parts) != len(fields) or parts[0] != version:
         raise ValueError('Unsupported diagnostic schema')
     values = list(map(float, parts))
     if not all(math.isfinite(v) for v in values):

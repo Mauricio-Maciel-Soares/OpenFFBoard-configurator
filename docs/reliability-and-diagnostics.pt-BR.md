@@ -129,3 +129,27 @@ escrita e leitura real por PTY, falhas de perfis, recuperação de arquivos, det
 de recursos antigos, diálogos Qt, CSV e identificação para reconexão. A estabilidade
 prolongada, a reconexão USB física e o funcionamento no seu Windows 10 precisam ser
 confirmados com a placa conectada.
+
+## Estudo de torque/corrente e slots de slew
+
+Na janela de diagnóstico, **Torque / current study** abre a captura dos quadros
+Iq registrados pelo firmware. Informe o Kt do motor (valor inicial 1,11 Nm/A),
+instância do ODrive e rótulo. **Stop → Export trace CSV** preserva os dados;
+**Analyze / export JSON** agrupa erro de corrente por RPM, sentido e quadrante.
+O histórico anterior ao início é descartado. Perdas, reinicializações e descarte
+dos registros mais antigos pelo limite de 12000 amostras são informados.
+
+**Advanced axis settings → Persistent slew profiles** permite gravar três taxas
+por eixo e ativar um slot. Zero desativa o limite; editar um slot ativo aplica
+sua nova taxa. As operações exigem reconhecimento e leitura de confirmação.
+A gravação permanente é responsabilidade do novo firmware. Slots de slew na
+placa são independentes dos perfis gerais JSON do configurador.
+
+Firmwares antigos continuam funcionando: comandos novos só são enviados se
+anunciados na lista de recursos. Não são criadas forças, não são retunados ganhos
+e não são configuradas taxas CAN durante a captura. Sem quadros Get_Iq, não há
+corrente a exibir. Kt × Iq é uma estimativa eletromagnética, não torque medido
+no eixo. Timestamps de RX e idades não comprovam latência física.
+
+Protocolo completo, requisitos de CAN, migração e roteiro de ensaio:
+[torque-study-pt-BR.md](https://github.com/Mauricio-Maciel-Soares/OpenFFBoard/blob/torque-observability-profiles-v1.17.1/docs/torque-study-pt-BR.md).

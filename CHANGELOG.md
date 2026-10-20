@@ -1,3 +1,9 @@
+## Unreleased — torque/current study and persistent slew slots
+
+- Read extended firmware loop/CAN timing, with fallback to existing diagnostics.
+- Capture timestamped Iq observations and export CSV/RPM analysis without motor-setting commands.
+- Configure three on-board slew slots with acknowledged writes and readback.
+
 ### Unreleased — reliability and diagnostics
 - Preserve command terminators and UTF-8 packet limits; support address zero and partial writes.
 - Add bounded per-command deadlines, explicit failures, stale-reply protection and optional device reconnection.
