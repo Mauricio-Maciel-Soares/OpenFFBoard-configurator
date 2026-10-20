@@ -9,6 +9,7 @@ Authors : yannick, vincet
 import logging
 import PyQt6.QtCore
 import PyQt6.QtWidgets
+import PyQt6.uic
 import helper
 import serial_comms
 
