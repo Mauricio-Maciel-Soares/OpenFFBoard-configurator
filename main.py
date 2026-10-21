@@ -95,6 +95,8 @@ class MainUi(PyQt6.QtWidgets.QMainWindow, base_ui.WidgetUI, base_ui.Communicatio
         self.connected = False
         self.not_minimize_and_close = True
         self.serial_timer = None
+        self._port_reset_generation = 0
+        self._resetting_port = False
 
         self.systray : SystrayWrapper = None
 
@@ -570,35 +572,46 @@ class MainUi(PyQt6.QtWidgets.QMainWindow, base_ui.WidgetUI, base_ui.Communicatio
         self.reset_port()
         self.serialchooser.request_reconnect(force=True)
 
+    def cancel_pending_port_close(self):
+        """Invalidate delayed cleanup before opening a new connection."""
+        self._port_reset_generation += 1
+
     def reset_port(self, immediate=False):
         """Close serial port and remove tabs.
 
         Set immediate to close the port without waiting for pending data to be sent.
         Required when the event loop is about to stop as the delayed close would never run.
         """
+        if self._resetting_port:
+            return
+        self.cancel_pending_port_close()
+        generation = self._port_reset_generation
         self.log("Reset port")
         self.profile_ui.setEnabled(False)
         #self.serial.waitForBytesWritten(250) # Broken on pyqt6.3
 
         # Workaround until waitForBytesWritten works again or a better solution has been found
         def close():
-            self.serial.close()
-            self.comms_reset()
-            self.timeouting = False
-            self.process_events_timer.stop() # Never left running if the reply does not arrive
-            if self.serial_timer:
-                self.serial_timer.stop()
-            self.serialchooser.update()
-            self.reset_tabs()
+            if generation != self._port_reset_generation or self._resetting_port:
+                return
+            self._resetting_port = True
+            try:
+                if self.serial.isOpen():
+                    self.serial.close()
+                self.comms_reset()
+                self.timeouting = False
+                self.process_events_timer.stop() # Never left running if the reply does not arrive
+                if self.serial_timer:
+                    self.serial_timer.stop()
+                self.serialchooser.update()
+                self.reset_tabs()
+            finally:
+                self._resetting_port = False
 
-        if self.serial.bytesToWrite() > 0:
+        if not immediate and self.serial.isOpen() and self.serial.bytesToWrite() > 0:
             # Not everything has been sent
             self.serial.flush() # Immediately send
-
-            if immediate:
-                close()
-            else:
-                PyQt6.QtCore.QTimer.singleShot(250, close) # Close port after 250ms because no signal is currently working. Should ensure data has been sent.
+            PyQt6.QtCore.QTimer.singleShot(250, close)
 
         else:
             close() # Close port

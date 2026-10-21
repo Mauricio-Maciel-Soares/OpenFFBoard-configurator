@@ -95,8 +95,45 @@ anteriores, inclusive `$XDG_CONFIG_HOME/openffboard` no Linux.
   Com número de série USB, acompanha o mesmo dispositivo mesmo que a porta mude.
   Sem número de série, exige o mesmo VID/PID e caminho da porta; nesse caso não é
   possível distinguir duas placas idênticas que ocupem a mesma porta.
-- **Disconnect**, **Cancel reconnect** e a saída da aplicação cancelam tentativas.
+- **Disconnect**, **Cancel connection**, **Cancel reconnect** e a saída da aplicação cancelam tentativas.
   Comandos pendentes e perfis não são reaplicados ao reconectar.
+
+### Falha ao abrir a porta no Windows
+
+Se aparecer **Connecting...**, uma mensagem de E/S anulada e depois **Can not
+open port**, a falha ocorreu durante a abertura da porta, antes dos comandos de
+identificação e do Profile Manager. O texto corresponde ao erro 995
+(`ERROR_OPERATION_ABORTED`) do Windows; sozinho não identifica a causa.
+
+A conexão agora informa a porta, a etapa (`configure`, `open` ou `DTR`), a
+categoria de erro do Qt e a mensagem original do sistema. Para `ResourceError`
+(categoria usada pelo Qt para E/S cancelada), faz no máximo três tentativas, com
+pausas de 500 e 1000 ms. Cada nova tentativa exige a mesma identidade USB; não
+troca para outra placa. Porta ausente, identidade ambígua e acesso negado
+interrompem a abertura. **Cancel connection** interrompe as tentativas.
+
+A abertura configura 115200, 8N1, sem controle de fluxo e verifica a ativação de
+DTR antes de iniciar os comandos. Não usa `clear(AllDirections)` após abrir:
+essa operação do Qt aborta leituras/escritas assíncronas no Windows. Limpa os
+buffers do aplicativo antes de abrir. Erros durante a comunicação são tratados
+fora do callback de E/S; fechamentos antigos não podem encerrar uma sessão nova.
+O fechamento imediato não tenta enviar dados pelo handle que acabou de falhar.
+
+Para testar o pacote atualizado:
+
+1. Feche todas as instâncias do configurador, inclusive pela bandeja do sistema,
+   e outros programas que estejam usando a porta serial.
+2. Desconecte e reconecte o USB da placa.
+3. Extraia o ZIP inteiro em uma pasta nova e execute `OpenFFBoard.exe` nela.
+4. Atualize a lista de portas e selecione a porta atual do OpenFFBoard.
+5. Se continuar falhando, copie o log completo desde **Connecting to COM...**,
+   incluindo a etapa e todas as tentativas.
+
+Essas correções e os testes de simulação não comprovam a causa do erro 995 em
+um PC específico nem substituem o teste com a placa e o driver Windows.
+
+Referências: [códigos de erro do Windows](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--500-999-),
+[QSerialPort](https://doc.qt.io/qt-6/qserialport.html).
 
 Não use o terminal para enviar comandos concorrentes aos mesmos parâmetros
 durante uma aplicação de perfil ou uma alteração verificada. Respostas manuais
