@@ -81,6 +81,32 @@ class TestSerialOverPty(unittest.TestCase):
         self.assertEqual(opened, ["1.17.0"])
         self.assertEqual(got, [str(i) for i in range(50)])
 
+    def test_verified_write_over_real_serial_port(self):
+        """The readback is requested only after the peer acknowledges the SET."""
+        os.set_blocking(self.master, False)
+        received, done, errors = [], [], []
+        buffer = bytearray()
+        def peer():
+            try:
+                buffer.extend(os.read(self.master, 4096))
+            except BlockingIOError:
+                return
+            while b';' in buffer:
+                command, _, rest = buffer.partition(b';')
+                buffer[:] = rest
+                received.append(command)
+                value = b'OK' if command == b'axis.0.maxtorquerate=600' else b'600'
+                os.write(self.master, b'[' + command + b'|' + value + b']\n')
+        timer = QTimer()
+        timer.timeout.connect(peer)
+        timer.start(5)
+        self.comms.setValueVerified(self, 'axis', 'maxtorquerate', 600, done.append, errors.append)
+        self.pump(150)
+        timer.stop()
+        self.assertEqual(received, [b'axis.0.maxtorquerate=600', b'axis.0.maxtorquerate?'])
+        self.assertEqual(done, ['600'])
+        self.assertFalse(errors)
+
 
 if __name__ == "__main__":
     unittest.main()

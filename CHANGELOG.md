@@ -1,3 +1,17 @@
+## Unreleased — torque/current study and persistent slew slots
+
+- Read extended firmware loop/CAN timing, with fallback to existing diagnostics.
+- Capture timestamped Iq observations and export CSV/RPM analysis without motor-setting commands.
+- Configure three on-board slew slots with acknowledged writes and readback.
+
+### Unreleased — reliability and diagnostics
+- Preserve command terminators and UTF-8 packet limits; support address zero and partial writes.
+- Add bounded per-command deadlines, explicit failures, stale-reply protection and optional device reconnection.
+- Confirm profile changes with SET acknowledgements and device readback; save profiles atomically with recovery backups.
+- Add capability-probed encvel / maxtorquerate controls and profile support.
+- Add passive telemetry history, CSV export and explicit ODrive 0.5.6 axis-error decoding.
+- Isolate throttled edits per widget, add automated regressions and migrate build actions to Node.js 24.
+
 ### v1.17.1
 - Fixed app staying alive in the background after closing the window on linux
 - Serial port and timers are now released on every exit path
