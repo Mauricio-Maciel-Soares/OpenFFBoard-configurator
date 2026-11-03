@@ -7,7 +7,7 @@ from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                             QComboBox, QSpinBox, QCheckBox, QFileDialog, QPlainTextEdit)
 from base_ui import CommunicationHandler
-from diagnostics import AXIS_FIELDS, ODRIVE_FIELDS, parse_payload, loop_rates, decode_axis_errors, export_csv
+from diagnostics import AXIS_FIELDS, ODRIVE_FIELDS, parse_payload, loop_rates, slew_observations, decode_axis_errors, export_csv
 from profile_store import atomic_write
 from torque_trace_ui import TorqueTraceDialog
 
@@ -71,7 +71,13 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
                              ("Firmware loop interval standard deviation (µs)", 'axis_window_stddev_us'),
                              ("CAN encoder interval (µs)", 'odrive_encoder_interval_last_us'),
                              ("CAN Iq interval (µs)", 'odrive_iq_interval_last_us'),
-                             ("ODrive measured Iq, fresh only (A)", 'iq_fresh_measured_a')):
+                             ("ODrive measured Iq, fresh only (A)", 'iq_fresh_measured_a'),
+                             ("Slew mode (1 = asymmetric)", 'axis_slew_mode'),
+                             ("Slew rise limit (counts/ms)", 'axis_slew_up_counts_ms'),
+                             ("Slew fall limit (counts/ms)", 'axis_slew_down_counts_ms'),
+                             ("Slew limited updates (cumulative)", 'axis_slew_limited_updates'),
+                             ("Slew delta correction (cumulative counts)", 'axis_slew_delta_counts'),
+                             ("Observed average magnitude rate (counts/ms)", 'slew_observed_magnitude_rate_counts_ms')):
             self.metric.addItem(title, field)
         self.metric.currentIndexChanged.connect(self._plot)
         layout.addWidget(self.metric)
@@ -158,7 +164,7 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
                'request_timeouts': self.comms.requests.timeouts, 'request_errors': self.comms.requests.errors,
                'disconnects': self.disconnects}
         self.previous_start = started
-        axis_cmd = 'diag' if ('axis', self.axis, 'diag2') in self.unsupported else 'diag2'
+        axis_cmd = ('diag' if ('axis', self.axis, 'diag2') in self.unsupported else ('diag2' if ('axis', self.axis, 'diag3') in self.unsupported else 'diag3'))
         commands = [('axis', self.axis, axis_cmd), ('main', 0, 'hidrate'), ('main', 0, 'cfrate')]
         if ('axis', self.axis, 'diag') in self.unsupported:
             commands[0] = ('axis', self.axis, 'curtorque')
@@ -195,12 +201,14 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
                 row['{}_{}_reply_s'.format(cls, cmd)] = time.monotonic() - self.start_time
                 row['{}_{}_request_ms'.format(cls, cmd)] = (time.monotonic() - sent) * 1000
                 try:
-                    if cmd in ('diag', 'diag2'):
+                    if cmd in ('diag', 'diag2', 'diag3'):
                         data = parse_payload(value, AXIS_FIELDS if cls == 'axis' else ODRIVE_FIELDS)
                         prefix = 'axis_' if cls == 'axis' else 'odrive_'
                         row.update({prefix + k: v for k, v in data.items()})
                         if cls == 'axis':
                             row.update(loop_rates(self.previous_axis, data))
+                            if data.get('version') == 3:
+                                row.update(slew_observations(self.previous_axis, data))
                             self.previous_axis = data
                         else:
                             fresh = data['iq_sequence'] != 0 and data['iq_age_ms'] <= 50
@@ -226,7 +234,9 @@ class DiagnosticsDialog(QDialog, CommunicationHandler):
                     return
                 if error.code == 'NOT_FOUND':
                     self.unsupported.add(key)
-                    if cmd == 'diag2':
+                    if cmd == 'diag3':
+                        commands.insert(0, (cls, instance, 'diag2'))
+                    elif cmd == 'diag2':
                         commands.insert(0, (cls, instance, 'diag'))
                     elif key == ('axis', self.axis, 'diag'):
                         commands.insert(0, ('axis', self.axis, 'curtorque'))
