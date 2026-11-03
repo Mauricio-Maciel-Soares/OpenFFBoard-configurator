@@ -4,6 +4,8 @@ import io
 import math
 from torque_study import AXIS_V2_EXTRA, ODRIVE_V2_EXTRA
 
+AXIS_V3_EXTRA = 'slew_mode slew_up_counts_ms slew_down_counts_ms slew_fallback_counts_ms slew_power_clip_updates slew_limited_updates slew_delta_counts'.split()
+
 AXIS_FIELDS = "version sequence time_us dt_us min_dt_us max_dt_us clip_count slew_count effect_counts requested_counts clipped_counts output_counts position_speed_deg_s encoder_speed_deg_s speed_deg_s accel_deg_s2 encoder_valid encoder_used driver_ready".split()
 ODRIVE_FIELDS = "version time_ms iq_sequence iq_age_ms iq_setpoint_a iq_measured_a encoder_sequence encoder_age_ms velocity_turns_s tx_sequence tx_age_ms queued_torque_nm tx_errors".split()
 
@@ -35,7 +37,10 @@ def decode_axis_errors(code, version='raw'):
 def parse_payload(payload, fields):
     parts = payload.strip().split(',')
     version = '1'
-    if parts[0] == '2' and fields in (AXIS_FIELDS, ODRIVE_FIELDS):
+    if parts[0] == '3' and fields == AXIS_FIELDS:
+        fields = fields + AXIS_V2_EXTRA + AXIS_V3_EXTRA
+        version = '3'
+    elif parts[0] == '2' and fields in (AXIS_FIELDS, ODRIVE_FIELDS):
         fields = fields + (AXIS_V2_EXTRA if fields == AXIS_FIELDS else ODRIVE_V2_EXTRA)
         version = '2'
     if len(parts) != len(fields) or parts[0] != version:
@@ -59,6 +64,23 @@ def loop_rates(previous, current):
         if delta <= 100000:
             result[name] = delta * 1000000 / elapsed
     return result
+
+
+def slew_observations(previous, current):
+    """Average magnitude change between snapshots; not transition peak rate."""
+    if previous is None:
+        return {}
+    elapsed = (int(current['time_us']) - int(previous['time_us'])) & 0xffffffff
+    if not 0 < elapsed < 10000000:
+        return {}
+    delta = abs(current['output_counts']) - abs(previous['output_counts'])
+    return {
+        'slew_observed_magnitude_rate_counts_ms': abs(delta) / (elapsed / 1000.0),
+        'slew_observed_direction': 'rise' if delta > 0 else ('fall' if delta < 0 else 'steady'),
+        'slew_delta_counts_increment': (int(current['slew_delta_counts']) - int(previous['slew_delta_counts'])) & 0xffffffffffffffff,
+        'slew_limited_updates_increment': (int(current['slew_limited_updates']) - int(previous['slew_limited_updates'])) & 0xffffffff,
+        'slew_power_clip_updates_increment': (int(current['slew_power_clip_updates']) - int(previous['slew_power_clip_updates'])) & 0xffffffff,
+    }
 
 
 def export_csv(rows):

@@ -200,6 +200,32 @@ de recursos antigos, diálogos Qt, CSV e identificação para reconexão. A esta
 prolongada, a reconexão USB física e o funcionamento no seu Windows 10 precisam ser
 confirmados com a placa conectada.
 
+### Snapshot de slew assimétrico (diag3)
+
+O Live Diagnostics tenta primeiro `axis.N.diag3?`. Esse snapshot versão 3
+preserva todos os campos de `diag2` e acrescenta, nesta ordem:
+
+```text
+slew_mode,slew_up_counts_ms,slew_down_counts_ms,slew_fallback_counts_ms,
+slew_power_clip_updates,slew_limited_updates,slew_delta_counts
+```
+
+Os valores de subida/descida iguais a zero significam herdar
+`maxtorquerate`; `slew_fallback_counts_ms` informa esse limite legado.
+Os contadores e a configuração são copiados no mesmo snapshot crítico do
+firmware. Firmwares antigos continuam usando a sequência de fallback
+`diag3 → diag2 → diag → curtorque`.
+
+O CSV inclui os valores configurados e incrementos dos contadores entre
+amostras. A taxa observada é calculada pela variação da magnitude de
+`output_counts` dividida pelo tempo real entre snapshots. Como o Live
+Diagnostics coleta até 5 amostras/s, essa taxa é uma média entre snapshots,
+não a taxa instantânea do limitador e não serve para validar diretamente
+1000/500 counts/ms. Para validar as taxas configuradas durante uma transição,
+use uma captura dedicada com amostragem de alta frequência ou o trace local
+sincronizado. O delta acumulado é a soma de correções do slew, não torque
+físico nem uma taxa.
+
 ## Estudo de torque/corrente e slots de slew
 
 Na janela de diagnóstico, **Torque / current study** abre a captura dos quadros
