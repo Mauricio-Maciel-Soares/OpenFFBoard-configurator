@@ -9,6 +9,7 @@ Authors : yannick, vincet
 import logging
 import PyQt6.QtCore
 import PyQt6.QtWidgets
+import PyQt6.uic
 import helper
 import serial_comms
 
@@ -135,6 +136,8 @@ class CommunicationHandler:
         adr=None,
         typechar="?",
         delete=True,
+        on_error=None,
+        timeout=3.0,
     ):
         """Ask a value to the board from in async way."""
         self.comms.getValueAsync(
@@ -147,16 +150,43 @@ class CommunicationHandler:
             adr=adr,
             typechar=typechar,
             delete=delete,
+            on_error=on_error,
+            timeout=timeout,
         )
+
+    def get_capabilities(self, cls, callback, instance=0, on_error=None):
+        from command_capabilities import parse_capabilities
+        key = (cls, instance)
+        if key in self.comms.capabilities:
+            callback(self.comms.capabilities[key])
+            return
+        def received(capabilities):
+            self.comms.capabilities[key] = capabilities
+            callback(capabilities)
+        self.get_value_async(cls, 'help', received, instance=instance, typechar='!',
+                             conversion=parse_capabilities, on_error=on_error)
+
+    def get_supported_value(self, cls, cmd, callback, instance=0, conversion=None,
+                            on_error=None, require_write=False):
+        from command_requests import CommandError
+        def available(capabilities):
+            flags = capabilities.get(cmd, {}).get('flags', set())
+            if 'R' not in flags or (require_write and 'W' not in flags):
+                (on_error or self.comms._log_error)(CommandError('NOT_FOUND', '{}.{}.{}'.format(cls, instance, cmd)))
+                return
+            self.get_value_async(cls, cmd, callback, instance=instance,
+                                 conversion=conversion, on_error=on_error)
+        self.get_capabilities(cls, available, instance, on_error)
 
     def serial_write_raw(self, cmd):
         """Write a command in direct mode througt serial."""
         self.comms.serialWriteRaw(cmd)
 
-    def send_value(self, cls, cmd, val, adr=None, instance=0):
+    def send_value(self, cls, cmd, val, adr=None, instance=0, callback=None, on_error=None):
         """Send a value for a specific paramter to the board."""
         self.comms.sendValue(
-            self, cls=cls, cmd=cmd, val=val, adr=adr, instance=instance
+            self, cls=cls, cmd=cmd, val=val, adr=adr, instance=instance,
+            callback=callback, on_error=on_error
         )
 
     def send_command(self, cls, cmd, instance=0, typechar="?",adr=None):
@@ -165,13 +195,11 @@ class CommunicationHandler:
 
     def send_commands(self, cls, cmds, instance=0, typechar="?",adr=None):
         """Send colection of command to the board."""
-        cmdstring = ""
         for cmd in cmds:
-            if adr != None:
-                cmdstring += f"{cls}.{instance}.{cmd}{typechar}{adr};"
-            else:
-                cmdstring += f"{cls}.{instance}.{cmd}{typechar};"
-        self.comms.serialWriteRaw(cmdstring)
+            self.send_command(cls, cmd, instance, typechar, adr)
+
+    def set_value_verified(self, cls, cmd, val, callback, on_error=None, instance=0, adr=None):
+        self.comms.setValueVerified(self, cls, cmd, val, callback, on_error, instance, adr)
 
     def comms_reset(self):
         """Send the reset reply."""

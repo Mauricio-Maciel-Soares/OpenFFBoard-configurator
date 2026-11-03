@@ -91,9 +91,12 @@ class MainUi(PyQt6.QtWidgets.QMainWindow, base_ui.WidgetUI, base_ui.Communicatio
         base_ui.CommunicationHandler.comms = serial_comms.SerialComms(self, self.serial)
         self.main_class_ui = None
         self.timeouting = False
+        self._heartbeat_failures = 0
         self.connected = False
         self.not_minimize_and_close = True
         self.serial_timer = None
+        self._port_reset_generation = 0
+        self._resetting_port = False
 
         self.systray : SystrayWrapper = None
 
@@ -365,28 +368,29 @@ class MainUi(PyQt6.QtWidgets.QMainWindow, base_ui.WidgetUI, base_ui.Communicatio
         msg.exec()
 
     def timeout_check_cb(self, port_checked):
-        """Close the serial connection if the port is not open after a timeout."""
-        self.process_events_timer.stop()
-        if port_checked != self.serialchooser.main_id:
-            self.reset_port()
-            self.log("Communication error. Please reconnect")
-        else:
-            self.timeouting = False
+        self.timeouting = False
+        self._heartbeat_failures = 0
+        if self.serialchooser.main_id is not None and port_checked != self.serialchooser.main_id:
+            self.log("Board mode changed; reconnecting")
+            self.reconnect()
+
+    def _heartbeat_failed(self, error):
+        self.timeouting = False
+        if not self.serial.isOpen() or error.code in ('DISCONNECTED', 'CANCELLED'):
+            return
+        self._heartbeat_failures += 1
+        self.log("Connection check: " + str(error))
+        if self._heartbeat_failures >= 2:
+            self.log("Board did not answer two connection checks")
+            self.reset_port(immediate=True)
 
     def update_timer(self):
-        """Check on timer if the port is always opened."""
-        if self.serial.isOpen():
-            if self.timeouting:
-                self.timeouting = False
-                self.reset_port()
-                self.log("Timeout. Please reconnect")
-                return
-            else:
-                self.timeouting = True
-                self.process_events_timer.start(100)
-                self.get_value_async("main", "id", self.timeout_check_cb, conversion=int)
-                self.get_value_async("sys", "heapfree", self.wrapper_status_bar.update_ram_used)
-                self.get_value_async("sys", "temp", self.wrapper_status_bar.update_temp)
+        if self.serial.isOpen() and self.connected and not self.timeouting:
+            self.timeouting = True
+            self.get_value_async("main", "id", self.timeout_check_cb, conversion=int,
+                                 timeout=2.0, on_error=self._heartbeat_failed)
+            self.get_value_async("sys", "heapfree", self.wrapper_status_bar.update_ram_used)
+            self.get_value_async("sys", "temp", self.wrapper_status_bar.update_temp)
 
     def tab_changed(self, id_tab):
         """Add an handler on tab changed : do nothing for the moment."""
@@ -566,7 +570,11 @@ class MainUi(PyQt6.QtWidgets.QMainWindow, base_ui.WidgetUI, base_ui.Communicatio
     def reconnect(self):
         """Reconnect the board : re-open the serial link, and check it."""
         self.reset_port()
-        PyQt6.QtCore.QTimer.singleShot(1500, self.serialchooser.serial_connect_button)
+        self.serialchooser.request_reconnect(force=True)
+
+    def cancel_pending_port_close(self):
+        """Invalidate delayed cleanup before opening a new connection."""
+        self._port_reset_generation += 1
 
     def reset_port(self, immediate=False):
         """Close serial port and remove tabs.
@@ -574,29 +582,36 @@ class MainUi(PyQt6.QtWidgets.QMainWindow, base_ui.WidgetUI, base_ui.Communicatio
         Set immediate to close the port without waiting for pending data to be sent.
         Required when the event loop is about to stop as the delayed close would never run.
         """
+        if self._resetting_port:
+            return
+        self.cancel_pending_port_close()
+        generation = self._port_reset_generation
         self.log("Reset port")
         self.profile_ui.setEnabled(False)
         #self.serial.waitForBytesWritten(250) # Broken on pyqt6.3
 
         # Workaround until waitForBytesWritten works again or a better solution has been found
         def close():
-            self.serial.close()
-            self.comms_reset()
-            self.timeouting = False
-            self.process_events_timer.stop() # Never left running if the reply does not arrive
-            if self.serial_timer:
-                self.serial_timer.stop()
-            self.serialchooser.update()
-            self.reset_tabs()
+            if generation != self._port_reset_generation or self._resetting_port:
+                return
+            self._resetting_port = True
+            try:
+                if self.serial.isOpen():
+                    self.serial.close()
+                self.comms_reset()
+                self.timeouting = False
+                self.process_events_timer.stop() # Never left running if the reply does not arrive
+                if self.serial_timer:
+                    self.serial_timer.stop()
+                self.serialchooser.update()
+                self.reset_tabs()
+            finally:
+                self._resetting_port = False
 
-        if self.serial.bytesToWrite() > 0:
+        if not immediate and self.serial.isOpen() and self.serial.bytesToWrite() > 0:
             # Not everything has been sent
             self.serial.flush() # Immediately send
-
-            if immediate:
-                close()
-            else:
-                PyQt6.QtCore.QTimer.singleShot(250, close) # Close port after 250ms because no signal is currently working. Should ensure data has been sent.
+            PyQt6.QtCore.QTimer.singleShot(250, close)
 
         else:
             close() # Close port
@@ -718,31 +733,23 @@ class MainUi(PyQt6.QtWidgets.QMainWindow, base_ui.WidgetUI, base_ui.Communicatio
         self.get_value_async("sys", "signature", sig_cb,typechar="!")
     
     def serial_connected(self, connected):
-        """Check the release when a board is connected."""
-        
-        def timer_cb():
-            if not self.connected:
-                self.log("Can't detect board")
-                self.reset_port()
-
-        def id_cb(identifier):
-            if identifier:
-                self.serial_timer.stop()
-                self.connected = True
-
+        self._heartbeat_failures = 0
+        self.timeouting = False
         if connected:
-            self.get_value_async("main", "id", id_cb, 0)
+            def detected(identifier):
+                self.connected = True  # Main ID zero is valid.
+            def failed(error):
+                self.log("Cannot detect board: " + str(error))
+                if self.serial.isOpen():
+                    self.reset_port(immediate=True)
+            self.get_value_async("main", "id", detected, conversion=int,
+                                 timeout=3.0, on_error=failed)
             self.errors_dlg.registerCallbacks()
-            
-            if (self.serial_timer is None) :
-                self.serial_timer = PyQt6.QtCore.QTimer(singleShot=True, timeout=timer_cb)
-            self.serial_timer.start(500)
-
         else:
             self.connected = False
             self.log("Disconnected")
             self.reset_tabs()
-            self.comms.removeAllCallbacks() # Ensure everything is cleared
+            self.comms.removeAllCallbacks()
 
     def reset_factory(self, btn):
         """Send a async message to reset factory settings."""
@@ -798,6 +805,7 @@ class MainUi(PyQt6.QtWidgets.QMainWindow, base_ui.WidgetUI, base_ui.Communicatio
         self._shutdown_done = True
 
         self.timer.stop()
+        self.serialchooser.cancel_reconnect()
         self.reset_port(immediate=True) # Closes the port and stops the serial timers
         self.comms.removeAllCallbacks()
 

@@ -71,39 +71,31 @@ def qtBlockAndCall(object : QObject,function,value):
     object.blockSignals(False)
 
 def throttle(ms):
-
-    time_of_last_call = time.time()
-    timer = QTimer()
-    timer.setSingleShot(True)
-
+    """Coalesce rapid edits per widget, using a monotonic clock."""
     def decorator(fn):
-        def wrapper(*args, **kwargs):
-            def call():
-                nonlocal time_of_last_call 
-                time_of_last_call = time.time()
-                fn(*args, **kwargs)
-            
-            now = time.time()
-            time_since_last_call = now - time_of_last_call
-
-            # Call immediately if last call is older than timeout
-            if time_since_last_call > ms/1000:
-                if timer.isActive():
-                    timer.stop()
-                return call()
-
-            else: # delay execution
-                if timer.isActive():
-                    timer.stop()
-
-                # Disconnect previous call
-                try: timer.timeout.disconnect()
-                except Exception: pass
-
-                # Connect timer
+        attribute = '_throttle_' + fn.__name__
+        @wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            state = getattr(self, attribute, None)
+            if state is None:
+                timer = QTimer(self if isinstance(self, QObject) else None)
+                timer.setSingleShot(True)
+                state = {'timer': timer, 'last': float('-inf'), 'pending': None}
+                setattr(self, attribute, state)
+                def call():
+                    pending = state['pending']
+                    state['pending'] = None
+                    if pending is not None:
+                        state['last'] = time.monotonic()
+                        fn(self, *pending[0], **pending[1])
                 timer.timeout.connect(call)
-                timer.setInterval(ms)
-                timer.start()     
+                state['call'] = call
+            state['pending'] = (args, kwargs)
+            elapsed = (time.monotonic() - state['last']) * 1000
+            state['timer'].stop()
+            if elapsed >= ms:
+                return state['call']()
+            state['timer'].start(max(1, int(ms - elapsed)))
         return wrapper
     return decorator
 
