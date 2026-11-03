@@ -3,7 +3,7 @@ name: Build Configurator
 # Controls when the workflow will run
 on:
   push:
-    branches: 
+    branches:
       - master
       - development
   pull_request:
@@ -11,7 +11,7 @@ on:
       - master
       - development
       - torque-observability-profiles
-      
+
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
   workflow_call:
@@ -40,24 +40,23 @@ jobs:
   # Build
   Build:
     needs: Test
-    # The type of runner that the job will run on
     runs-on: ${{ matrix.conf.os }}
     strategy:
       fail-fast: false
       matrix:
-        conf:  [ {os: 'windows-latest', pyver: '3.8'},{os: 'windows-latest', pyver: '3.12'}, {os: 'macos-latest', pyver: '3.11'}]
+        conf:
+          - {os: 'windows-latest', pyver: '3.8'}
+          - {os: 'windows-latest', pyver: '3.12'}
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v7.0.1
 
       - id: build
         uses: ./.github/actions/build-pyinstaller
-        with: 
+        with:
           path: '${{ github.workspace }}'
           python-version: '${{ matrix.conf.pyver }}'
-        
+
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: OpenFFBoard-Configurator-${{ matrix.conf.os }}-py${{ matrix.conf.pyver }}
