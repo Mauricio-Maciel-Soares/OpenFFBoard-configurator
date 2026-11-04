@@ -313,11 +313,10 @@ class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
 
         self.main.log("Serial error on {}: {} ({}): {}".format(
             self._serial.portName(), error.name, error.value, self._serial.errorString()))
-        # Once the port is open, any transport error can leave QSerialPort open
-        # while the USB CDC endpoint is no longer usable. In particular, Windows
-        # may report ERROR_OPERATION_ABORTED as UnknownError rather than
-        # ResourceError. Close outside readyRead/write callbacks so Qt can unwind
-        # its pending I/O before the handle and request queues are reset.
+        # Once the port is open, an I/O error can leave QSerialPort open
+        # while the USB CDC endpoint is no longer usable. UnknownError is Qt's
+        # generic unidentified serial error. Close outside readyRead/write
+        # callbacks so Qt can unwind pending I/O before queues and handle reset.
         runtime_errors = (
             errors.ResourceError,
             errors.DeviceNotFoundError,
