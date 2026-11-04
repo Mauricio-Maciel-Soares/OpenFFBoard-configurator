@@ -82,35 +82,75 @@ class AdvancedAxisDialog(QDialog, CommunicationHandler):
         self.encvel.hide()
         self._busy(True)
         self.status.setText("Reading supported settings...")
-        remaining = {'maxtorquerate', 'encvel'}
-        messages = []
-        def finish(cmd):
-            remaining.discard(cmd)
+
+        def capabilities_received(capabilities):
+            if generation != self.generation:
+                return
+
+            supported = []
+            messages = []
+            for cmd in ("maxtorquerate", "encvel"):
+                flags = capabilities.get(cmd, {}).get("flags", set())
+                if "R" in flags and "W" in flags:
+                    supported.append(cmd)
+                else:
+                    messages.append(cmd + ": not supported for read/write by this firmware")
+
+            remaining = set(supported)
+
+            def finish(cmd):
+                remaining.discard(cmd)
+                if not remaining:
+                    self._busy(False)
+                    self.status.setText("; ".join(messages) if messages else "Values read from the board.")
+
+            def received(cmd, value):
+                if generation != self.generation:
+                    return
+                if (cmd == "encvel" and value not in (0, 1)) or not 0 <= value <= 4294967295:
+                    messages.append(cmd + ": invalid device value")
+                else:
+                    self.values[cmd] = value
+                    if cmd == "encvel":
+                        self.encvel.setChecked(bool(value))
+                        self.encvel.show()
+                    else:
+                        self.rate.setValue(value)
+                finish(cmd)
+
+            def failed(cmd, error):
+                if generation != self.generation:
+                    return
+                messages.append(cmd + ": " + str(error))
+                finish(cmd)
+
             if not remaining:
                 self._busy(False)
-                self.status.setText("; ".join(messages) if messages else "Values read from the board.")
-        def received(cmd, value):
+                self.status.setText("; ".join(messages) or "No advanced settings are supported by this firmware.")
+                return
+
+            # Query help! only once. Asking for it separately per setting creates
+            # duplicate, large CSV replies on a protocol without transaction IDs.
+            for cmd in supported:
+                self.get_value_async(
+                    "axis", cmd,
+                    lambda value, name=cmd: received(name, value),
+                    instance=self.axis,
+                    conversion=int,
+                    on_error=lambda error, name=cmd: failed(name, error),
+                )
+
+        def capabilities_failed(error):
             if generation != self.generation:
                 return
-            if (cmd == 'encvel' and value not in (0, 1)) or not 0 <= value <= 4294967295:
-                messages.append(cmd + ": invalid device value")
-            else:
-                self.values[cmd] = value
-                if cmd == 'encvel':
-                    self.encvel.setChecked(bool(value))
-                    self.encvel.show()
-                else:
-                    self.rate.setValue(value)
-            finish(cmd)
-        def failed(cmd, error):
-            if generation != self.generation:
-                return
-            messages.append(cmd + (": not supported by this firmware" if error.code == 'NOT_FOUND' else ": " + str(error)))
-            finish(cmd)
-        for cmd in tuple(remaining):
-            self.get_supported_value('axis', cmd, lambda v, c=cmd: received(c, v), self.axis, int,
-                                     require_write=True,
-                                 on_error=lambda e, c=cmd: failed(c, e))
+            self._busy(False)
+            self.status.setText("Could not read firmware capabilities: " + str(error))
+
+        self.get_capabilities(
+            "axis", capabilities_received,
+            instance=self.axis,
+            on_error=capabilities_failed,
+        )
 
     def apply_values(self):
         desired = {'maxtorquerate': int(self.rate.value()), 'encvel': int(self.encvel.isChecked())}
