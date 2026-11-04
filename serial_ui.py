@@ -313,8 +313,21 @@ class SerialChooser(base_ui.WidgetUI, base_ui.CommunicationHandler):
 
         self.main.log("Serial error on {}: {} ({}): {}".format(
             self._serial.portName(), error.name, error.value, self._serial.errorString()))
-        if error in (errors.ResourceError, errors.DeviceNotFoundError, errors.PermissionError) and self._serial.isOpen():
-            # Never reset queues/close a Windows handle from inside its own I/O callback.
+        # Once the port is open, any transport error can leave QSerialPort open
+        # while the USB CDC endpoint is no longer usable. In particular, Windows
+        # may report ERROR_OPERATION_ABORTED as UnknownError rather than
+        # ResourceError. Close outside readyRead/write callbacks so Qt can unwind
+        # its pending I/O before the handle and request queues are reset.
+        runtime_errors = (
+            errors.ResourceError,
+            errors.DeviceNotFoundError,
+            errors.PermissionError,
+            errors.ReadError,
+            errors.WriteError,
+            errors.OpenError,
+            errors.UnknownError,
+        )
+        if error in runtime_errors and self._serial.isOpen():
             session = self._session
             if self._error_session != session:
                 self._error_session = session
