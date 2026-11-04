@@ -255,6 +255,21 @@ class SerialConnectionTests(unittest.TestCase):
         self.assertEqual(self.port.close_calls, 1)
         self.assertEqual(self.states, [True, False])
 
+    def test_unknown_read_and_write_errors_close_the_unusable_runtime_session(self):
+        self.chooser.serial_connect_button()
+        self.assertTrue(self.port.isOpen())
+        for error in (Errors.UnknownError, Errors.ReadError, Errors.WriteError):
+            with self.subTest(error=error):
+                self.port.fail(error)
+                # Closing is deferred until Qt has unwound the serial callback.
+                self.assertTrue(self.port.isOpen())
+                app.processEvents()
+                self.assertFalse(self.port.isOpen())
+                self.assertEqual(self.states[-1], False)
+                self.chooser.serial_connect_button()
+                self.assertTrue(self.port.isOpen())
+                self.states.clear()
+
     def test_error_inside_write_does_not_reset_queues_reentrantly(self):
         self.chooser.serial_connect_button()
         self.main.comms.reset()
